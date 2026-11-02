@@ -323,6 +323,50 @@ unsafe fn grouping_key_order_is_pushdown_safe(args: &CreateUpperPathsHookArgs) -
     })
 }
 
+/// Returns whether an aggregate argument is an expression that only the DataFusion
+/// backend can evaluate, such as `SUM(price - discount)`.
+unsafe fn has_expression_aggregate(
+    args: &CreateUpperPathsHookArgs,
+    input_rel: &pg_sys::RelOptInfo,
+) -> bool {
+    let root = args.root;
+    let parse = (*root).parse;
+    if parse.is_null() {
+        return false;
+    }
+    let Some(heap_rti) = range_table::bms_exactly_one_member(input_rel.relids) else {
+        return false;
+    };
+    let Some(heap_relid) = range_table::get_rte(
+        (*root).simple_rel_array_size as usize,
+        (*root).simple_rte_array,
+        heap_rti,
+    )
+    .and_then(range_table::get_plain_relation_relid) else {
+        return false;
+    };
+    let Some((_, index)) = rel_get_bm25_index(heap_relid) else {
+        return false;
+    };
+
+    let mut aggrefs = (*parse).targetList.collect_nodes::<pg_sys::Aggref>();
+    aggrefs.extend((*parse).havingQual.collect_nodes::<pg_sys::Aggref>());
+    aggrefs.into_iter().any(|aggref| {
+        !crate::api::is_agg_funcoid((*aggref).aggfnoid.to_u32())
+            && PgList::<pg_sys::TargetEntry>::from_pg((*aggref).args)
+                .get_ptr(0)
+                .is_some_and(|arg| {
+                    aggregate_type::ParsedAggregateField::from_index(
+                        (*arg).expr.cast(),
+                        crate::postgres::var::VarContext::from_planner(root),
+                        &index,
+                        heap_rti,
+                    )
+                    .is_err()
+                })
+    })
+}
+
 /// A collection of index information that is necessary for making result-rewriting decisions
 pub struct AggIndexInfo {
     pub created_by_version: Option<crate::api::version::Version>,
@@ -704,6 +748,9 @@ impl CustomScan for AggregateScan {
                             // rejects DATE(timestamptz) and non-bare timestamp expressions.
                             || (!has_paradedb_agg && builder.args().has_date_group())
                             || groupby::has_ungrouped_column(builder.args())
+                            // Tantivy aggregates single fields; an expression
+                            // over columns only runs on DataFusion.
+                            || has_expression_aggregate(builder.args(), input_rel)
                     };
                 let use_datafusion = use_datafusion && (!has_paradedb_agg || pdb_route.is_some());
                 if use_datafusion {
@@ -1017,8 +1064,21 @@ impl CustomScan for AggregateScan {
                 }
 
                 // Show aggregates
-                let format_agg = |a: &join_targetlist::JoinAggregateEntry| -> String {
-                    if a.field_refs.is_empty() {
+                let format_agg = |(idx, a): (usize, &join_targetlist::JoinAggregateEntry)| {
+                    let expression_arg = a
+                        .expression_arg
+                        .then(|| unsafe {
+                            datafusion_exec::raw_aggregate_arg(
+                                &df_state.targetlist,
+                                df_state.custom_scan_tlist,
+                                idx,
+                            )
+                        })
+                        .flatten()
+                        .and_then(|arg| explainer.deparse_expr(arg));
+                    if let Some(arg) = expression_arg {
+                        format!("{}({arg})", a.agg_kind)
+                    } else if a.field_refs.is_empty() {
                         // CountStar displays as "COUNT(*)" — no extra wrapping needed.
                         // Other no-arg aggregates (none currently) also use Display directly.
                         a.agg_kind.to_string()
@@ -1032,6 +1092,7 @@ impl CustomScan for AggregateScan {
                     .targetlist
                     .aggregates
                     .iter()
+                    .enumerate()
                     .map(format_agg)
                     .collect();
                 for w in &df_state.targetlist.window_aggregates {
@@ -1050,7 +1111,7 @@ impl CustomScan for AggregateScan {
                             Some(join_targetlist::WindowAggInput::Aggregate(idx)) => {
                                 format!(
                                     "{op}({}) OVER ()",
-                                    format_agg(&df_state.targetlist.aggregates[*idx])
+                                    format_agg((*idx, &df_state.targetlist.aggregates[*idx]))
                                 )
                             }
                         },

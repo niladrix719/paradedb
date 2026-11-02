@@ -449,7 +449,7 @@ EXPLAIN (FORMAT TEXT, COSTS OFF, TIMING OFF, VERBOSE)
 SELECT AVG(LENGTH(description))
 FROM products
 WHERE category ||| 'Electronics';
-WARNING:  Aggregate Scan not used: argument to aggregate function is neither a direct column reference nor a COALESCE expression. To disable this warning: SET paradedb.planner_warnings = 'off' (table: products)
+WARNING:  Aggregate Scan (DataFusion) not used: aggregate argument products.description is not columnar indexed (table: products)
                                                                                                  QUERY PLAN                                                                                                 
 ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Aggregate
@@ -467,7 +467,7 @@ WARNING:  Aggregate Scan not used: argument to aggregate function is neither a d
 SELECT AVG(LENGTH(description))
 FROM products
 WHERE category ||| 'Electronics';
-WARNING:  Aggregate Scan not used: argument to aggregate function is neither a direct column reference nor a COALESCE expression. To disable this warning: SET paradedb.planner_warnings = 'off' (table: products)
+WARNING:  Aggregate Scan (DataFusion) not used: aggregate argument products.description is not columnar indexed (table: products)
          avg         
 ---------------------
  24.5000000000000000

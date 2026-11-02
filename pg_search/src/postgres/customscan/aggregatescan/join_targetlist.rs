@@ -27,6 +27,7 @@ use super::datafusion_build::{
     FilterExprBuildContext, JoinAggSource, ResolutionSource, collect_join_agg_sources,
     resolve_source_field,
 };
+use super::datafusion_exec::translate_expression_arg;
 use super::pdb_agg::{PdbAggFieldRef, PdbAggRequest};
 use super::privdat::FilterExpr;
 use crate::api::{SortDirection, pdb_agg_spec};
@@ -252,6 +253,10 @@ pub struct JoinAggregateEntry {
     /// stored representation and leaves this `None`.
     #[serde(default)]
     pub numeric: Option<SearchFieldType>,
+    /// The argument is an expression, such as `price - discount`, over the
+    /// columns in `field_refs`. Execution translates it from the raw `Aggref`.
+    #[serde(default)]
+    pub expression_arg: bool,
 }
 
 /// What a post-grouping `OVER ()` window aggregate reads as its argument.
@@ -1239,6 +1244,7 @@ unsafe fn extract_raw_aggregate_entry(
             distinct: false,
             order_by: Vec::new(),
             numeric: None,
+            expression_arg: false,
         });
     }
     let mut agg_kind = classify_aggregate_oid(aggfnoid, (*aggref).aggstar, has_distinct)
@@ -1259,7 +1265,11 @@ unsafe fn extract_raw_aggregate_entry(
         agg_kind =
             AggKind::StringAgg(extract_string_agg_separator(aggref).unwrap_or_else(|| ",".into()));
     }
-    let field_refs = extract_aggref_field_refs(context, aggref, is_string_agg)?;
+    let expression_arg = expression_argument(aggref);
+    let field_refs = match expression_arg {
+        Some(expr) => extract_expression_field_refs(context, aggref, expr)?,
+        None => extract_aggref_field_refs(context, aggref, is_string_agg)?,
+    };
     let order_by =
         extract_aggref_order_by(aggref, context.sources, context.plan, context.outer_root_id)?;
     let numeric = numeric_agg_field_type(&agg_kind, &field_refs, has_distinct)?;
@@ -1272,7 +1282,109 @@ unsafe fn extract_raw_aggregate_entry(
         distinct: has_distinct,
         order_by,
         numeric,
+        expression_arg: expression_arg.is_some(),
     })
+}
+
+/// The first argument of `aggref` when it is an expression rather than a
+/// column, such as `price - discount` in `SUM(price - discount)`.
+unsafe fn expression_argument(aggref: *mut pg_sys::Aggref) -> Option<*mut pg_sys::Node> {
+    if (*aggref).aggstar {
+        return None;
+    }
+    let args = PgList::<pg_sys::TargetEntry>::from_pg((*aggref).args);
+    let expr = (*args.get_ptr(0)?).expr.cast::<pg_sys::Node>();
+    unwrap_to_var(expr).is_none().then_some(expr)
+}
+
+/// The columns an expression argument reads. Each must resolve to a fast field,
+/// and the expression must translate to DataFusion.
+unsafe fn extract_expression_field_refs(
+    context: &RawColumnContext<'_>,
+    aggref: *mut pg_sys::Aggref,
+    expr: *mut pg_sys::Node,
+) -> Result<Vec<JoinAggColRef>, String> {
+    // PostgreSQL adds the aggregate's ORDER BY columns to `args` as resjunk entries.
+    let arg_count = PgList::<pg_sys::TargetEntry>::from_pg((*aggref).args)
+        .iter_ptr()
+        .filter(|arg| !(**arg).resjunk)
+        .count();
+    if arg_count != 1 {
+        return Err("aggregate argument expressions require a single argument".into());
+    }
+    // DataFusion counts a computed -0.0 and 0.0 as two values, PostgreSQL as one.
+    if !(*aggref).aggdistinct.is_null()
+        && matches!(
+            pg_sys::exprType(expr),
+            pg_sys::FLOAT4OID | pg_sys::FLOAT8OID
+        )
+    {
+        return Err("DISTINCT over a float aggregate argument expression is not supported".into());
+    }
+    if expr.contains_param() || expr.contains_type(pg_sys::NodeTag::T_SubPlan) {
+        return Err("aggregate arguments with parameters or subqueries are not supported".into());
+    }
+    if expr.any(|node| {
+        crate::postgres::customscan::joinscan::planning::get_score_func_rti(node.cast()).is_some()
+    }) {
+        return Err("aggregate arguments over a score are not supported".into());
+    }
+    // DataFusion may fold or share calls that the UDF fallback declares immutable.
+    if pg_sys::contain_volatile_functions(expr) {
+        return Err("aggregate arguments with volatile functions are not supported".into());
+    }
+
+    let mut refs = Vec::new();
+    for var in expr.collect_nodes::<pg_sys::Var>() {
+        if (*var).varlevelsup != 0 {
+            return Err("aggregate arguments over an outer query are not supported".into());
+        }
+        // A NUMERIC fast field is read in its storage encoding (scaled integers or
+        // decimal bytes), which native DataFusion arithmetic would misread (#6792).
+        if (*var).vartype == pg_sys::NUMERICOID {
+            return Err("aggregate arguments over NUMERIC columns are not supported".into());
+        }
+        let resolved = resolve_var_source(
+            context,
+            (*var).varno as pg_sys::Index,
+            (*var).varattno,
+            "aggregate argument",
+        )?;
+        refs.push(JoinAggColRef {
+            plan_position: resolved.plan_position,
+            attno: resolved.attno,
+            field_name: resolved.field_name,
+            numeric: None,
+        });
+    }
+
+    if translate_expression_arg(&refs, context.plan, expr).is_none() {
+        return Err("aggregate argument cannot be translated for aggregate-on-join".into());
+    }
+    Ok(refs)
+}
+
+/// Whether `expr` is only `float8` columns and constants combined with `+`, `-` and `*`, which
+/// run natively in DataFusion. Overflow and underflow then give `Infinity` or `0` where
+/// PostgreSQL errors. Everything else is evaluated by PostgreSQL.
+pub(super) unsafe fn is_float8_arithmetic(node: *mut pg_sys::Node) -> bool {
+    match (*node).type_ {
+        pg_sys::NodeTag::T_Var => (*node.cast::<pg_sys::Var>()).vartype == pg_sys::FLOAT8OID,
+        pg_sys::NodeTag::T_Const => {
+            let c = node.cast::<pg_sys::Const>();
+            (*c).consttype == pg_sys::FLOAT8OID && !(*c).constisnull
+        }
+        pg_sys::NodeTag::T_OpExpr => {
+            let op = node.cast::<pg_sys::OpExpr>();
+            matches!(
+                pg_sys::get_opcode((*op).opno).to_u32(),
+                pg_sys::F_FLOAT8PL | pg_sys::F_FLOAT8MI | pg_sys::F_FLOAT8MUL
+            ) && PgList::<pg_sys::Node>::from_pg((*op).args)
+                .iter_ptr()
+                .all(|arg| is_float8_arithmetic(arg))
+        }
+        _ => false,
+    }
 }
 
 /// The `pdb.agg()` calls of the grouping output, lowered to decide the route.

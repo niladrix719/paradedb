@@ -34,7 +34,9 @@
 //! materialization, no SegmentedTopK — aggregates run entirely on fast fields
 //! and the result is aggregate rows, not individual tuples.
 
-use super::join_targetlist::{AggOrderByEntry, GroupingTransform};
+use super::join_targetlist::{
+    AggOrderByEntry, GroupingTransform, JoinAggColRef, is_float8_arithmetic,
+};
 use super::pdb_agg::{
     PdbAggColumn, PdbAggFieldRef, PdbAggPlan, PdbAggRequest, PdbKeySpec, PdbMetricSpec, PdbStat,
 };
@@ -68,6 +70,7 @@ use crate::postgres::customscan::joinscan::scan_state::{
 };
 use crate::postgres::customscan::joinscan::{CtidColumn, ScoreColumn};
 use crate::postgres::customscan::limit_offset::{LimitClauseKind, LimitOffset};
+use crate::postgres::node::NodeExt;
 use crate::scan::PgSearchTableProvider;
 use crate::scan::table_provider::pg_search_provider_from_scan;
 use crate::schema::SearchFieldType;
@@ -243,11 +246,29 @@ pub async fn build_join_aggregate_plan(
                 pdb_entries.push((i, request.as_ref(), agg.filter.is_some()));
                 return Ok(None);
             }
+            let field_col = || -> Result<Expr> {
+                if agg.expression_arg {
+                    unsafe {
+                        agg_expression_arg(
+                            agg,
+                            plan,
+                            raw_aggregate_arg(targetlist, custom_scan_tlist, i),
+                        )
+                    }
+                } else {
+                    agg_field_col(agg, plan)
+                }
+            };
             let agg_expr = match agg.agg_kind {
                 AggKind::CountStar => Ok(count(lit(1))),
-                AggKind::Count => agg_field_col(agg, plan).map(count),
+                AggKind::Count => field_col().map(count),
                 AggKind::CountDistinct => {
-                    let col_exprs = agg_field_cols(agg, plan)?;
+                    // An expression's `field_refs` are its columns, not the value to count.
+                    let col_exprs = if agg.expression_arg {
+                        vec![field_col()?]
+                    } else {
+                        agg_field_cols(agg, plan)?
+                    };
                     Ok(Expr::AggregateFunction(AggregateFunction::new_udf(
                         count_udaf(),
                         col_exprs,
@@ -257,24 +278,24 @@ pub async fn build_join_aggregate_plan(
                         None,   // null_treatment
                     )))
                 }
-                AggKind::Sum => agg_field_col(agg, plan).map(|col| match &agg.numeric {
+                AggKind::Sum => field_col().map(|col| match &agg.numeric {
                     None => sum(col),
                     Some(field_type) => numeric_sum(col, field_type),
                 }),
-                AggKind::Avg => agg_field_col(agg, plan).map(|col| match &agg.numeric {
+                AggKind::Avg => field_col().map(|col| match &agg.numeric {
                     None => avg(col),
                     Some(field_type) => numeric_avg(col, field_type),
                 }),
-                AggKind::Min => agg_field_col(agg, plan).map(min),
-                AggKind::Max => agg_field_col(agg, plan).map(max),
-                AggKind::StddevSamp => agg_field_col(agg, plan).map(stddev),
-                AggKind::StddevPop => agg_field_col(agg, plan).map(stddev_pop),
-                AggKind::VarSamp => agg_field_col(agg, plan).map(var_sample),
-                AggKind::VarPop => agg_field_col(agg, plan).map(var_pop),
-                AggKind::BoolAnd => agg_field_col(agg, plan).map(bool_and),
-                AggKind::BoolOr => agg_field_col(agg, plan).map(bool_or),
+                AggKind::Min => field_col().map(min),
+                AggKind::Max => field_col().map(max),
+                AggKind::StddevSamp => field_col().map(stddev),
+                AggKind::StddevPop => field_col().map(stddev_pop),
+                AggKind::VarSamp => field_col().map(var_sample),
+                AggKind::VarPop => field_col().map(var_pop),
+                AggKind::BoolAnd => field_col().map(bool_and),
+                AggKind::BoolOr => field_col().map(bool_or),
                 AggKind::ArrayAgg => {
-                    let col_expr = agg_field_col(agg, plan)?;
+                    let col_expr = field_col()?;
                     if agg.order_by.is_empty() {
                         Ok(array_agg(col_expr))
                     } else {
@@ -289,7 +310,7 @@ pub async fn build_join_aggregate_plan(
                     }
                 }
                 AggKind::StringAgg(ref sep) => {
-                    let col_expr = agg_field_col(agg, plan)?;
+                    let col_expr = field_col()?;
                     let sep_lit = lit(sep.clone());
                     if agg.order_by.is_empty() {
                         Ok(datafusion::functions_aggregate::string_agg::string_agg(
@@ -1548,6 +1569,97 @@ fn agg_field_col(agg: &JoinAggregateEntry, plan: &RelNode) -> Result<Expr> {
         DataFusionError::Internal("non-COUNT(*) aggregate must have a field reference".to_string())
     })?;
     Ok(make_plan_position_col(plan, r.plan_position, &r.field_name))
+}
+
+/// The first argument of the aggregate at `agg_idx`, read from its raw `Aggref`,
+/// which follows the group columns in `custom_scan_tlist`.
+pub(super) unsafe fn raw_aggregate_arg(
+    targetlist: &JoinAggregateTargetList,
+    custom_scan_tlist: *mut pg_sys::List,
+    agg_idx: usize,
+) -> Option<*mut pg_sys::Node> {
+    let te = pgrx::PgList::<pg_sys::TargetEntry>::from_pg(custom_scan_tlist)
+        .get_ptr(targetlist.group_columns.len() + agg_idx)?;
+    let aggref = crate::nodecast!(Aggref, T_Aggref, (*te).expr);
+    debug_assert!(
+        aggref.is_some(),
+        "custom_scan_tlist lists aggregates after group columns"
+    );
+    let aggref = aggref?;
+    let arg = pgrx::PgList::<pg_sys::TargetEntry>::from_pg((*aggref).args).get_ptr(0)?;
+    Some((*arg).expr.cast())
+}
+
+/// Translate the expression argument of an aggregate, such as `price - discount`
+/// in `SUM(price - discount)`. Only float8 arithmetic runs natively; PostgreSQL
+/// evaluates the rest, so its errors match.
+unsafe fn agg_expression_arg(
+    agg: &JoinAggregateEntry,
+    plan: &RelNode,
+    expr: Option<*mut pg_sys::Node>,
+) -> Result<Expr> {
+    let expr = expr.ok_or_else(|| {
+        DataFusionError::Internal("aggregate expression argument is missing".into())
+    })?;
+    translate_expression_arg(&agg.field_refs, plan, expr).ok_or_else(|| {
+        DataFusionError::Internal("Failed to translate aggregate argument expression".into())
+    })
+}
+
+/// The DataFusion expression for an aggregate's expression argument `expr`, whose columns
+/// planning resolved to `field_refs`. Planning calls this too, so a query it accepts translates.
+pub(super) unsafe fn translate_expression_arg(
+    field_refs: &[JoinAggColRef],
+    plan: &RelNode,
+    expr: *mut pg_sys::Node,
+) -> Option<Expr> {
+    let mapper = AggregateArgMapper {
+        vars: expr
+            .collect_nodes::<pg_sys::Var>()
+            .into_iter()
+            .map(|var| ((*var).varno as pg_sys::Index, (*var).varattno))
+            .collect(),
+        field_refs,
+        plan,
+    };
+    let sources = plan.output_sources();
+    let translator = PredicateTranslator::new(&sources).with_mapper(Box::new(mapper));
+    if is_float8_arithmetic(expr) {
+        translator.translate(expr)
+    } else {
+        translator.try_wrap_as_udf(expr)
+    }
+}
+
+/// Maps the Vars of an aggregate's expression argument to the columns planning
+/// resolved for them, which `field_refs` lists in the same order. It matches by
+/// position because the plan can renumber the Vars after planning.
+struct AggregateArgMapper<'a> {
+    vars: Vec<(pg_sys::Index, pg_sys::AttrNumber)>,
+    field_refs: &'a [JoinAggColRef],
+    plan: &'a RelNode,
+}
+
+impl AggregateArgMapper<'_> {
+    fn field_ref(
+        &self,
+        varno: pg_sys::Index,
+        varattno: pg_sys::AttrNumber,
+    ) -> Option<&JoinAggColRef> {
+        let idx = self.vars.iter().position(|var| *var == (varno, varattno))?;
+        self.field_refs.get(idx)
+    }
+}
+
+impl ColumnMapper for AggregateArgMapper<'_> {
+    fn map_var(&self, varno: pg_sys::Index, varattno: pg_sys::AttrNumber) -> Option<Expr> {
+        let r = self.field_ref(varno, varattno)?;
+        Some(make_plan_position_col(
+            self.plan,
+            r.plan_position,
+            &r.field_name,
+        ))
+    }
 }
 
 /// Convert aggregate ORDER BY entries to DataFusion `Sort` expressions.

@@ -1,0 +1,600 @@
+-- Aggregates over expressions of columnar fields, such as SUM(price - discount),
+-- run on the DataFusion backend: Tantivy only aggregates single fields.
+-- https://github.com/paradedb/paradedb/issues/7075
+CREATE EXTENSION IF NOT EXISTS pg_search;
+SET max_parallel_workers_per_gather = 0;
+SET paradedb.enable_aggregate_custom_scan TO on;
+CREATE TABLE expr_invoices (
+    id SERIAL PRIMARY KEY,
+    customer_id INTEGER,
+    description TEXT,
+    status TEXT,
+    price FLOAT8,
+    discount FLOAT8,
+    qty INTEGER,
+    amount NUMERIC(10, 2),
+    fee NUMERIC(8, 3)
+);
+INSERT INTO expr_invoices (customer_id, description, status, price, discount, qty, amount, fee) VALUES
+    (1, 'red widget', 'paid', 100.0, 10.0, 2, 10.50, 0.125),
+    (1, 'blue widget', 'returned', 50.0, 5.0, 1, 20.00, 1.000),
+    (2, 'green widget', 'paid', 75.0, NULL, 3, NULL, 0.500),
+    (2, 'red gadget', 'returned', 20.0, 2.5, 4, 4.25, NULL),
+    (3, 'blue gadget', 'pending', 60.0, 0.0, NULL, 99.99, 2.250);
+CREATE INDEX expr_invoices_idx ON expr_invoices
+USING paradedb (id, customer_id, description, (status::pdb.literal), price, discount, qty, amount, fee);
+CREATE TABLE expr_customers (
+    id INTEGER PRIMARY KEY,
+    region TEXT
+);
+INSERT INTO expr_customers (id, region) VALUES (1, 'east'), (2, 'west'), (3, 'east');
+CREATE INDEX expr_customers_idx ON expr_customers
+USING paradedb (id, (region::pdb.literal));
+-- The query from the issue, with and without a FILTER.
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT SUM(price - discount) FILTER (WHERE status = 'returned'),
+       SUM(price - discount)
+FROM expr_invoices
+WHERE description ||| 'widget gadget';
+                                                                                                                                 QUERY PLAN                                                                                                                                  
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (ParadeDB Aggregate Scan)
+   Output: (sum((price - discount)) FILTER (WHERE (status = 'returned'::text))), (sum((price - discount)))
+   Backend: DataFusion
+   Indexes: expr_invoices_idx (expr_invoices)
+   Aggregates: SUM((expr_invoices.price - expr_invoices.discount)), SUM((expr_invoices.price - expr_invoices.discount))
+   DataFusion Physical Plan: 
+     : AggregateExec: mode=Single, gby=[], aggr=[sum(__common_expr_1) FILTER (WHERE expr_invoices_0.status = Utf8View("returned")) as agg_0, sum(__common_expr_1) as agg_1]
+     :   ProjectionExec: expr=[price@0 - discount@1 as __common_expr_1, status@2 as status]
+     :     CooperativeExec
+     :       PgSearchScan: table=expr_invoices, segments=1, visibility=eager, query={"with_index":{"query":{"match":{"field":"description","value":"widget gadget","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+(10 rows)
+
+SELECT SUM(price - discount) FILTER (WHERE status = 'returned'),
+       SUM(price - discount)
+FROM expr_invoices
+WHERE description ||| 'widget gadget';
+ sum  |  sum  
+------+-------
+ 62.5 | 212.5
+(1 row)
+
+-- Operators, aggregates, and NULL propagation, grouped.
+SELECT status,
+       AVG(price * qty),
+       MIN(price / 2),
+       MAX(qty % 3),
+       COUNT(price - discount),
+       SUM(COALESCE(discount, 0) + 1),
+       SUM(qty * 2),
+       SUM(-qty)
+FROM expr_invoices
+WHERE description ||| 'widget gadget'
+GROUP BY status
+ORDER BY status;
+  status  |  avg  | min  | max | count | sum | sum | sum 
+----------+-------+------+-----+-------+-----+-----+-----
+ paid     | 212.5 | 37.5 |   2 |     1 |  12 |  10 |  -5
+ pending  |       |   30 |     |     1 |   1 |     |    
+ returned |    65 |   10 |   1 |     2 | 9.5 |  10 |  -5
+(3 rows)
+
+-- HAVING over an expression aggregate.
+SELECT status, SUM(price - discount)
+FROM expr_invoices
+WHERE description ||| 'widget gadget'
+GROUP BY status
+HAVING SUM(price - discount) > 60
+ORDER BY status;
+  status  | sum  
+----------+------
+ paid     |   90
+ returned | 62.5
+(2 rows)
+
+-- An expression aggregate that only HAVING uses still runs on DataFusion.
+EXPLAIN (COSTS OFF)
+SELECT status
+FROM expr_invoices
+WHERE description ||| 'widget gadget'
+GROUP BY status
+HAVING SUM(price - discount) > 60;
+                                                                                                                                         QUERY PLAN                                                                                                                                          
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (ParadeDB Aggregate Scan)
+   Backend: DataFusion
+   Indexes: expr_invoices_idx (expr_invoices)
+   Group By: status
+   Aggregates: SUM((expr_invoices.price - expr_invoices.discount))
+   DataFusion Physical Plan: 
+     : FilterExec: agg_0@1 > 60
+     :   AggregateExec: mode=Single, gby=[status@0 as status], aggr=[sum(expr_invoices_0.price - expr_invoices_0.discount) as agg_0]
+     :     CooperativeExec
+     :       PgSearchScan: table=expr_invoices, segments=1, eager=[status], visibility=eager, query={"with_index":{"query":{"match":{"field":"description","value":"widget gadget","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+(10 rows)
+
+SELECT status
+FROM expr_invoices
+WHERE description ||| 'widget gadget'
+GROUP BY status
+HAVING SUM(price - discount) > 60
+ORDER BY status;
+  status  
+----------
+ paid
+ returned
+(2 rows)
+
+-- An expression over columns of a joined table.
+EXPLAIN (COSTS OFF)
+SELECT c.region, SUM(i.price - i.discount)
+FROM expr_invoices i JOIN expr_customers c ON i.customer_id = c.id
+WHERE i.description ||| 'widget gadget'
+GROUP BY c.region;
+                                                                                                                                     QUERY PLAN                                                                                                                                     
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (ParadeDB Aggregate Scan)
+   Backend: DataFusion
+   Indexes: expr_invoices_idx (i), expr_customers_idx (c)
+   Group By: region
+   Aggregates: SUM((i.price - i.discount))
+   DataFusion Physical Plan: 
+     : AggregateExec: mode=Single, gby=[region@2 as region], aggr=[sum(i_0.price - i_0.discount) as agg_0]
+     :   HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@1, customer_id@2)], projection=[price@2, discount@3, region@0]
+     :     CooperativeExec
+     :       PgSearchScan: table=c, segments=1, eager=[region], visibility=eager, query="all"
+     :     CooperativeExec
+     :       PgSearchScan: table=i, segments=1, dynamic_filters=1, visibility=eager, query={"with_index":{"query":{"match":{"field":"description","value":"widget gadget","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+(12 rows)
+
+SELECT c.region, SUM(i.price - i.discount), SUM(i.qty * c.id)
+FROM expr_invoices i JOIN expr_customers c ON i.customer_id = c.id
+WHERE i.description ||| 'widget gadget'
+GROUP BY c.region
+ORDER BY c.region;
+ region | sum  | sum 
+--------+------+-----
+ east   |  195 |   3
+ west   | 17.5 |  14
+(2 rows)
+
+-- DISTINCT counts the values of the expression, not of its columns: qty - customer_id
+-- is 1, 0, 1, 2 where the (qty, customer_id) pairs are all different.
+SELECT status, COUNT(DISTINCT qty - customer_id), SUM(DISTINCT qty * 2)
+FROM expr_invoices
+WHERE description ||| 'widget gadget'
+GROUP BY status
+ORDER BY status;
+  status  | count | sum 
+----------+-------+-----
+ paid     |     1 |  10
+ pending  |     0 |    
+ returned |     2 |  10
+(3 rows)
+
+-- ORDER BY inside the aggregate, on a column.
+SELECT status, array_agg(qty + 1 ORDER BY id)
+FROM expr_invoices
+WHERE description ||| 'widget gadget'
+GROUP BY status
+ORDER BY status;
+  status  | array_agg 
+----------+-----------
+ paid     | {3,4}
+ pending  | {NULL}
+ returned | {2,5}
+(3 rows)
+
+\echo 'Same results from PostgreSQL'
+Same results from PostgreSQL
+SET paradedb.enable_aggregate_custom_scan TO off;
+SELECT SUM(price - discount) FILTER (WHERE status = 'returned'),
+       SUM(price - discount)
+FROM expr_invoices
+WHERE description ||| 'widget gadget';
+ sum  |  sum  
+------+-------
+ 62.5 | 212.5
+(1 row)
+
+SELECT status,
+       AVG(price * qty),
+       MIN(price / 2),
+       MAX(qty % 3),
+       COUNT(price - discount),
+       SUM(COALESCE(discount, 0) + 1),
+       SUM(qty * 2),
+       SUM(-qty)
+FROM expr_invoices
+WHERE description ||| 'widget gadget'
+GROUP BY status
+ORDER BY status;
+  status  |  avg  | min  | max | count | sum | sum | sum 
+----------+-------+------+-----+-------+-----+-----+-----
+ paid     | 212.5 | 37.5 |   2 |     1 |  12 |  10 |  -5
+ pending  |       |   30 |     |     1 |   1 |     |    
+ returned |    65 |   10 |   1 |     2 | 9.5 |  10 |  -5
+(3 rows)
+
+SELECT status, SUM(price - discount)
+FROM expr_invoices
+WHERE description ||| 'widget gadget'
+GROUP BY status
+HAVING SUM(price - discount) > 60
+ORDER BY status;
+  status  | sum  
+----------+------
+ paid     |   90
+ returned | 62.5
+(2 rows)
+
+SELECT status
+FROM expr_invoices
+WHERE description ||| 'widget gadget'
+GROUP BY status
+HAVING SUM(price - discount) > 60
+ORDER BY status;
+  status  
+----------
+ paid
+ returned
+(2 rows)
+
+SELECT c.region, SUM(i.price - i.discount), SUM(i.qty * c.id)
+FROM expr_invoices i JOIN expr_customers c ON i.customer_id = c.id
+WHERE i.description ||| 'widget gadget'
+GROUP BY c.region
+ORDER BY c.region;
+ region | sum  | sum 
+--------+------+-----
+ east   |  195 |   3
+ west   | 17.5 |  14
+(2 rows)
+
+SELECT status, COUNT(DISTINCT qty - customer_id), SUM(DISTINCT qty * 2)
+FROM expr_invoices
+WHERE description ||| 'widget gadget'
+GROUP BY status
+ORDER BY status;
+  status  | count | sum 
+----------+-------+-----
+ paid     |     1 |  10
+ pending  |     0 |    
+ returned |     2 |  10
+(3 rows)
+
+SELECT status, array_agg(qty + 1 ORDER BY id)
+FROM expr_invoices
+WHERE description ||| 'widget gadget'
+GROUP BY status
+ORDER BY status;
+  status  | array_agg 
+----------+-----------
+ paid     | {3,4}
+ pending  | {NULL}
+ returned | {2,5}
+(3 rows)
+
+SET paradedb.enable_aggregate_custom_scan TO on;
+-- A bare column still runs on Tantivy.
+EXPLAIN (COSTS OFF)
+SELECT SUM(price)
+FROM expr_invoices
+WHERE description ||| 'widget gadget';
+                                                                                                QUERY PLAN                                                                                                 
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (ParadeDB Aggregate Scan) on expr_invoices
+   Index: expr_invoices_idx
+   Tantivy Query: {"with_index":{"query":{"match":{"field":"description","value":"widget gadget","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+     Applies to Aggregates: SUM(price)
+     Aggregate Definition: {"0":{"sum":{"field":"price","missing":null,"none_if_no_match":true}}}
+(5 rows)
+
+-- Declines: a column that is not columnar, NUMERIC expressions, a volatile function,
+-- a subquery, ORDER BY on the expression, extra arguments, and DISTINCT over a float expression.
+EXPLAIN (COSTS OFF)
+SELECT AVG(LENGTH(description))
+FROM expr_invoices
+WHERE description ||| 'widget gadget';
+WARNING:  Aggregate Scan (DataFusion) not used: aggregate argument expr_invoices.description is not columnar indexed (table: expr_invoices)
+                                                                                                   QUERY PLAN                                                                                                    
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Custom Scan (ParadeDB Base Scan) on expr_invoices
+         Table: expr_invoices
+         Index: expr_invoices_idx
+         Exec Method: NormalScanExecState
+         Scores: false
+         Tantivy Query: {"with_index":{"query":{"match":{"field":"description","value":"widget gadget","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+(7 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT SUM(amount - fee)
+FROM expr_invoices
+WHERE description ||| 'widget gadget';
+WARNING:  Aggregate Scan (DataFusion) not used: aggregate arguments over NUMERIC columns are not supported (table: expr_invoices)
+                                                                                                   QUERY PLAN                                                                                                    
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Custom Scan (ParadeDB Base Scan) on expr_invoices
+         Table: expr_invoices
+         Index: expr_invoices_idx
+         Exec Method: ColumnarExecState
+         Columnar: amount, fee
+         Scores: false
+         Tantivy Query: {"with_index":{"query":{"match":{"field":"description","value":"widget gadget","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+(8 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT SUM(price * random())
+FROM expr_invoices
+WHERE description ||| 'widget gadget';
+WARNING:  Aggregate Scan (DataFusion) not used: aggregate arguments with volatile functions are not supported (table: expr_invoices)
+                                                                                                   QUERY PLAN                                                                                                    
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Custom Scan (ParadeDB Base Scan) on expr_invoices
+         Table: expr_invoices
+         Index: expr_invoices_idx
+         Exec Method: ColumnarExecState
+         Columnar: price
+         Scores: false
+         Tantivy Query: {"with_index":{"query":{"match":{"field":"description","value":"widget gadget","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+(8 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT SUM(price + (SELECT c.id FROM expr_customers c WHERE c.id = expr_invoices.customer_id))
+FROM expr_invoices
+WHERE description ||| 'widget gadget';
+WARNING:  Aggregate Scan (DataFusion) not used: aggregate arguments with parameters or subqueries are not supported (table: expr_invoices)
+                                                                                                   QUERY PLAN                                                                                                    
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Custom Scan (ParadeDB Base Scan) on expr_invoices
+         Table: expr_invoices
+         Index: expr_invoices_idx
+         Exec Method: ColumnarExecState
+         Columnar: customer_id, price
+         Scores: false
+         Tantivy Query: {"with_index":{"query":{"match":{"field":"description","value":"widget gadget","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+   SubPlan 1
+     ->  Seq Scan on expr_customers c
+           Filter: (id = expr_invoices.customer_id)
+(11 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT array_agg(qty + 1 ORDER BY qty + 1)
+FROM expr_invoices
+WHERE description ||| 'widget gadget';
+WARNING:  Aggregate Scan (DataFusion) not used: ORDER BY within aggregate must reference a direct column (table: expr_invoices)
+                                                                                                      QUERY PLAN                                                                                                       
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Sort
+         Sort Key: ((qty + 1))
+         ->  Custom Scan (ParadeDB Base Scan) on expr_invoices
+               Table: expr_invoices
+               Index: expr_invoices_idx
+               Exec Method: NormalScanExecState
+               Scores: false
+               Tantivy Query: {"with_index":{"query":{"match":{"field":"description","value":"widget gadget","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+(9 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT string_agg(lower(status), ',')
+FROM expr_invoices
+WHERE description ||| 'widget gadget';
+WARNING:  Aggregate Scan (DataFusion) not used: aggregate argument expressions require a single argument (table: expr_invoices)
+                                                                                                   QUERY PLAN                                                                                                    
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Custom Scan (ParadeDB Base Scan) on expr_invoices
+         Table: expr_invoices
+         Index: expr_invoices_idx
+         Exec Method: ColumnarExecState
+         Columnar: status
+         Scores: false
+         Tantivy Query: {"with_index":{"query":{"match":{"field":"description","value":"widget gadget","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+(8 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT COUNT(DISTINCT price - discount)
+FROM expr_invoices
+WHERE description ||| 'widget gadget';
+WARNING:  Aggregate Scan (DataFusion) not used: DISTINCT over a float aggregate argument expression is not supported (table: expr_invoices)
+                                                                                                      QUERY PLAN                                                                                                       
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Sort
+         Sort Key: ((price - discount))
+         ->  Custom Scan (ParadeDB Base Scan) on expr_invoices
+               Table: expr_invoices
+               Index: expr_invoices_idx
+               Exec Method: NormalScanExecState
+               Scores: false
+               Tantivy Query: {"with_index":{"query":{"match":{"field":"description","value":"widget gadget","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+(9 rows)
+
+-- Expressions other than float8 arithmetic are evaluated by PostgreSQL, so they
+-- raise its errors and keep its types.
+CREATE TABLE expr_edge (
+    id SERIAL PRIMARY KEY,
+    big_a BIGINT,
+    big_b BIGINT,
+    price FLOAT8,
+    discount FLOAT8,
+    shipped DATE,
+    ordered DATE
+);
+INSERT INTO expr_edge (big_a, big_b, price, discount, shipped, ordered) VALUES
+    (9223372036854775807, 2, 10.0, 0.0, '2024-01-05', '2024-01-01'),
+    (1, 1, 20.0, 4.0, '2024-01-03', '2024-01-02');
+CREATE INDEX expr_edge_idx ON expr_edge
+USING paradedb (id, big_a, big_b, price, discount, shipped, ordered);
+SELECT SUM(big_a * big_b) FROM expr_edge WHERE id @@@ pdb.all();
+ERROR:  bigint out of range
+SELECT SUM(price / discount) FROM expr_edge WHERE id @@@ pdb.all();
+ERROR:  division by zero
+-- float8 arithmetic runs natively, so an overflow gives Infinity where PostgreSQL errors.
+-- Unary minus is evaluated by PostgreSQL.
+EXPLAIN (COSTS OFF)
+SELECT SUM(-price), MAX(price * 1e308) FROM expr_edge WHERE id @@@ pdb.all();
+                                                                                                                                                                                                                                QUERY PLAN                                                                                                                                                                                                                                
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (ParadeDB Aggregate Scan)
+   Backend: DataFusion
+   Indexes: expr_edge_idx (expr_edge)
+   Aggregates: SUM((- expr_edge.price)), MAX((expr_edge.price * '1e+308'::double precision))
+   DataFusion Physical Plan: 
+     : AggregateExec: mode=Single, gby=[], aggr=[sum(pdb_eval_expr_opexpr_878c2142(expr_edge_0.price)) as agg_0, max(expr_edge_0.price * 100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000) as agg_1]
+     :   CooperativeExec
+     :     PgSearchScan: table=expr_edge, segments=1, visibility=eager, query={"with_index":{"query":{"all":{"field":"id"}}}}
+(8 rows)
+
+SELECT SUM(-price), MAX(price * 1e308) FROM expr_edge WHERE id @@@ pdb.all();
+ sum |   max    
+-----+----------
+ -30 | Infinity
+(1 row)
+
+EXPLAIN (COSTS OFF)
+SELECT MAX(shipped - ordered) FROM expr_edge WHERE id @@@ pdb.all();
+                                                               QUERY PLAN                                                               
+----------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (ParadeDB Aggregate Scan)
+   Backend: DataFusion
+   Indexes: expr_edge_idx (expr_edge)
+   Aggregates: MAX((expr_edge.shipped - expr_edge.ordered))
+   DataFusion Physical Plan: 
+     : AggregateExec: mode=Single, gby=[], aggr=[max(pdb_eval_expr_opexpr_1a180e6a(expr_edge_0.shipped, expr_edge_0.ordered)) as agg_0]
+     :   CooperativeExec
+     :     PgSearchScan: table=expr_edge, segments=1, visibility=eager, query={"with_index":{"query":{"all":{"field":"id"}}}}
+(8 rows)
+
+SELECT MAX(shipped - ordered) FROM expr_edge WHERE id @@@ pdb.all();
+ max 
+-----
+   4
+(1 row)
+
+-- A date result has no supported output type, so it falls back.
+EXPLAIN (COSTS OFF)
+SELECT MAX(shipped + 1) FROM expr_edge WHERE id @@@ pdb.all();
+WARNING:  Aggregate Scan (DataFusion) not used: aggregate argument cannot be translated for aggregate-on-join (table: expr_edge)
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Aggregate
+   ->  Custom Scan (ParadeDB Base Scan) on expr_edge
+         Table: expr_edge
+         Index: expr_edge_idx
+         Exec Method: ColumnarExecState
+         Columnar: shipped
+         Scores: false
+         Full Index Scan: true
+         Tantivy Query: {"with_index":{"query":{"all":{"field":"id"}}}}
+(9 rows)
+
+SET paradedb.enable_aggregate_custom_scan TO off;
+SELECT SUM(big_a * big_b) FROM expr_edge WHERE id @@@ pdb.all();
+ERROR:  bigint out of range
+SELECT SUM(price / discount) FROM expr_edge WHERE id @@@ pdb.all();
+ERROR:  division by zero
+SELECT SUM(-price), MAX(price * 1e308) FROM expr_edge WHERE id @@@ pdb.all();
+ERROR:  value out of range: overflow
+SELECT MAX(shipped - ordered) FROM expr_edge WHERE id @@@ pdb.all();
+ max 
+-----
+   4
+(1 row)
+
+SET paradedb.enable_aggregate_custom_scan TO on;
+DROP TABLE expr_edge;
+-- MPP: the expression is evaluated in each producer worker.
+SET max_parallel_workers_per_gather TO 3;
+SET max_parallel_workers TO 8;
+SET min_parallel_table_scan_size TO 0;
+SET parallel_setup_cost TO 0;
+SET parallel_tuple_cost TO 0;
+SET paradedb.global_mutable_segment_rows = 0;
+CREATE TABLE expr_lines (
+    id SERIAL PRIMARY KEY,
+    note TEXT,
+    bucket INTEGER,
+    price FLOAT8,
+    discount FLOAT8
+);
+CREATE INDEX expr_lines_idx ON expr_lines
+USING paradedb (id, note, bucket, price, discount);
+INSERT INTO expr_lines (note, bucket, price, discount)
+SELECT 'line ' || g, g % 4, g * 1.5, g % 7
+FROM generate_series(1, 500) AS g;
+INSERT INTO expr_lines (note, bucket, price, discount)
+SELECT 'line ' || g, g % 4, g * 1.5, g % 7
+FROM generate_series(501, 1000) AS g;
+EXPLAIN (COSTS OFF)
+SELECT bucket, SUM(price - discount)
+FROM expr_lines
+WHERE note ||| 'line'
+GROUP BY bucket;
+                                                                                                                             QUERY PLAN                                                                                                                             
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (ParadeDB Aggregate Scan)
+   Backend: DataFusion
+   Indexes: expr_lines_idx (expr_lines)
+   Group By: bucket
+   Aggregates: SUM((expr_lines.price - expr_lines.discount))
+   DataFusion Physical Plan: 
+     : ┌───── DistributedExec
+     : │ CoalescePartitionsExec
+     : │   [Stage 2] => NetworkCoalesceExec: output_partitions=6, input_tasks=2
+     : └──────────────────────────────────────────────────
+     :   ┌───── Stage 2 ── tasks=2, partitions=3
+     :   │ AggregateExec: mode=FinalPartitioned, gby=[bucket@0 as bucket], aggr=[sum(expr_lines_0.price - expr_lines_0.discount) as agg_0]
+     :   │   [Stage 1] => NetworkShuffleExec: output_partitions=3, input_tasks=2
+     :   └──────────────────────────────────────────────────
+     :     ┌───── Stage 1 ── tasks=2, partitions=6
+     :     │ RepartitionExec: partitioning=Hash([bucket@0], 6), input_partitions=1
+     :     │   AggregateExec: mode=Partial, gby=[bucket@0 as bucket], aggr=[sum(expr_lines_0.price - expr_lines_0.discount) as agg_0]
+     :     │     DistributedLeafExec:
+     :     │       t0: PgSearchScan: table=expr_lines, segments=2, visibility=eager, query={"with_index":{"query":{"match":{"field":"note","value":"line","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+     :     │       t1: PgSearchScan: table=expr_lines, segments=2, visibility=eager, query={"with_index":{"query":{"match":{"field":"note","value":"line","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+     :     └──────────────────────────────────────────────────
+(21 rows)
+
+SELECT bucket, SUM(price - discount)
+FROM expr_lines
+WHERE note ||| 'line'
+GROUP BY bucket
+ORDER BY bucket;
+ bucket |  sum   
+--------+--------
+      0 | 187497
+      1 | 186373
+      2 | 186750
+      3 | 187127
+(4 rows)
+
+SET paradedb.enable_aggregate_custom_scan TO off;
+SELECT bucket, SUM(price - discount)
+FROM expr_lines
+WHERE note ||| 'line'
+GROUP BY bucket
+ORDER BY bucket;
+ bucket |  sum   
+--------+--------
+      0 | 187497
+      1 | 186373
+      2 | 186750
+      3 | 187127
+(4 rows)
+
+DROP TABLE expr_lines;
+DROP TABLE expr_customers;
+DROP TABLE expr_invoices;
+RESET paradedb.global_mutable_segment_rows;
+RESET parallel_tuple_cost;
+RESET parallel_setup_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers;
+RESET max_parallel_workers_per_gather;
+RESET paradedb.enable_aggregate_custom_scan;
