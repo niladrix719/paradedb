@@ -215,6 +215,26 @@ pub struct JoinAggColRef {
     pub numeric: Option<SearchFieldType>,
 }
 
+/// A column read by an aggregate-argument expression. `rti`/`attno` identify the `Var`
+/// in the expression; `source_attno` is the indexed column it reads, which differs
+/// for a `LATERAL unnest` output.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AggExprVar {
+    pub rti: pg_sys::Index,
+    pub attno: pg_sys::AttrNumber,
+    pub source_attno: pg_sys::AttrNumber,
+    pub plan_position: usize,
+    pub field_name: String,
+}
+
+/// An aggregate argument that is an expression, such as `price - discount`, carried as
+/// `nodeToString` text like `PgExpression` join filters.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AggArgExpr {
+    pub pg_node_string: String,
+    pub vars: Vec<AggExprVar>,
+}
+
 /// Aggregate ORDER BY entry (e.g. `STRING_AGG(col, ',' ORDER BY col2)`).
 /// Same identity model as [`JoinGroupColumn`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -258,6 +278,9 @@ pub struct JoinAggregateEntry {
     /// stored representation and leaves this `None`.
     #[serde(default)]
     pub numeric: Option<SearchFieldType>,
+    /// Set when the argument is an expression; `field_refs` is then empty.
+    #[serde(default)]
+    pub arg_expr: Option<AggArgExpr>,
 }
 
 /// What a post-grouping `OVER ()` window aggregate reads as its argument.
@@ -1271,6 +1294,7 @@ unsafe fn extract_raw_aggregate_entry(
             distinct: false,
             order_by: Vec::new(),
             numeric: None,
+            arg_expr: None,
         });
     }
     let mut agg_kind = classify_aggregate_oid(aggfnoid, (*aggref).aggstar, has_distinct)
@@ -1292,7 +1316,12 @@ unsafe fn extract_raw_aggregate_entry(
             "string_agg with a non-constant separator is not supported for aggregate-on-join",
         )?);
     }
-    let field_refs = extract_aggref_field_refs(context, aggref, is_string_agg)?;
+    let arg_expr = extract_aggref_arg_expr(context, aggref)?;
+    let field_refs = if arg_expr.is_some() {
+        Vec::new()
+    } else {
+        extract_aggref_field_refs(context, aggref, is_string_agg)?
+    };
     let order_by =
         extract_aggref_order_by(aggref, context.sources, context.plan, context.outer_root_id)?;
     let numeric = numeric_agg_field_type(&agg_kind, &field_refs, has_distinct)?;
@@ -1305,6 +1334,7 @@ unsafe fn extract_raw_aggregate_entry(
         distinct: has_distinct,
         order_by,
         numeric,
+        arg_expr,
     })
 }
 
@@ -1449,6 +1479,180 @@ unsafe fn extract_string_agg_separator(aggref: *mut pg_sys::Aggref) -> Option<St
     Some(s)
 }
 
+/// Result types an expression argument may have, following the plain-column path.
+fn expr_arg_type_supported(agg_kind: &AggKind, type_oid: pg_sys::Oid) -> bool {
+    use pg_sys::{BOOLOID, FLOAT4OID, FLOAT8OID, INT2OID, INT4OID, INT8OID, TEXTOID, VARCHAROID};
+    match agg_kind {
+        AggKind::Sum => matches!(
+            type_oid,
+            INT2OID | INT4OID | INT8OID | FLOAT4OID | FLOAT8OID
+        ),
+        // A text result is ordered by its collation, which the extractor checks.
+        AggKind::Min | AggKind::Max => matches!(
+            type_oid,
+            INT2OID | INT4OID | INT8OID | FLOAT4OID | FLOAT8OID | TEXTOID | VARCHAROID
+        ),
+        AggKind::Avg => matches!(
+            type_oid,
+            INT2OID | INT4OID | INT8OID | FLOAT4OID | FLOAT8OID
+        ),
+        AggKind::Count | AggKind::CountDistinct => matches!(
+            type_oid,
+            INT2OID | INT4OID | INT8OID | FLOAT4OID | FLOAT8OID | BOOLOID
+        ),
+        // No `smallint` or `real`: the array projection cannot read Int16 or Float32.
+        AggKind::ArrayAgg => matches!(
+            type_oid,
+            INT4OID | INT8OID | FLOAT8OID | BOOLOID | TEXTOID | VARCHAROID
+        ),
+        AggKind::StringAgg(_) => matches!(type_oid, TEXTOID | VARCHAROID),
+        AggKind::StddevSamp | AggKind::StddevPop | AggKind::VarSamp | AggKind::VarPop => {
+            matches!(
+                type_oid,
+                INT2OID | INT4OID | INT8OID | FLOAT4OID | FLOAT8OID
+            )
+        }
+        AggKind::BoolAnd | AggKind::BoolOr => type_oid == BOOLOID,
+        _ => false,
+    }
+}
+
+/// Column types an expression argument may read. NUMERIC is left out because its
+/// encoded storage makes per-row evaluation slower than not pushing down, and JSON
+/// because it is stored per path.
+fn expr_column_type_supported(type_oid: pg_sys::Oid) -> bool {
+    matches!(
+        type_oid,
+        pg_sys::INT2OID
+            | pg_sys::INT4OID
+            | pg_sys::INT8OID
+            | pg_sys::FLOAT4OID
+            | pg_sys::FLOAT8OID
+            | pg_sys::BOOLOID
+            | pg_sys::DATEOID
+            | pg_sys::TIMESTAMPOID
+            | pg_sys::TEXTOID
+            | pg_sys::VARCHAROID
+    )
+}
+
+/// The argument of an aggregate over an expression this scan can push down, such as
+/// `SUM(price - discount)`; `None` leaves the aggregate to the single-column path.
+/// Used by the planner to route to DataFusion and by the extractor.
+pub unsafe fn expression_aggregate_arg(aggref: *mut pg_sys::Aggref) -> Option<*mut pg_sys::Node> {
+    let has_distinct = !(*aggref).aggdistinct.is_null();
+    let kind =
+        classify_aggregate_oid((*aggref).aggfnoid.to_u32(), (*aggref).aggstar, has_distinct)?;
+    // ORDER BY only matters for ARRAY_AGG and STRING_AGG, which return DISTINCT
+    // elements unsorted. DataFusion has no STDDEV(DISTINCT).
+    let collects = matches!(kind, AggKind::ArrayAgg | AggKind::StringAgg(_));
+    let no_distinct = collects || matches!(kind, AggKind::StddevSamp | AggKind::StddevPop);
+    if (!(*aggref).aggorder.is_null() && !collects) || (has_distinct && no_distinct) {
+        return None;
+    }
+    // The aggregated values come first; the ORDER BY entries follow as resjunk.
+    // STRING_AGG's second value is its separator.
+    let args = PgList::<pg_sys::TargetEntry>::from_pg((*aggref).args);
+    let values = args.iter_ptr().filter(|te| !(**te).resjunk).count();
+    let expected = if matches!(kind, AggKind::StringAgg(_)) {
+        2
+    } else {
+        1
+    };
+    if values != expected {
+        return None;
+    }
+    let expr = (*args.get_ptr(0)?).expr as *mut pg_sys::Node;
+    if expr.is_null() || unwrap_to_var(expr).is_some() {
+        return None;
+    }
+    let result_type = pg_sys::exprType(expr);
+    // DataFusion's DISTINCT tells -0.0 from 0.0, which Postgres treats as equal.
+    if has_distinct && matches!(result_type, pg_sys::FLOAT4OID | pg_sys::FLOAT8OID) {
+        return None;
+    }
+    if !expr_arg_type_supported(&kind, result_type) {
+        return None;
+    }
+
+    let mut any_column = false;
+    let mut only_supported_columns = true;
+    expr.visit(|node| {
+        if let Some(var) = nodecast!(Var, T_Var, node) {
+            any_column = true;
+            only_supported_columns &= expr_column_type_supported((*var).vartype);
+        }
+    });
+    (any_column && only_supported_columns && expression_reads_only_the_row(expr)).then_some(expr)
+}
+
+/// Whether `expr` depends only on the row, which is all `PgExprUdf` can evaluate: no
+/// parameter, subquery, nested aggregate, placeholder, volatile function or score.
+unsafe fn expression_reads_only_the_row(expr: *mut pg_sys::Node) -> bool {
+    use pg_sys::NodeTag as T;
+    let refused = expr.any(|node| {
+        matches!(
+            (*node).type_,
+            T::T_Param
+                | T::T_SubPlan
+                | T::T_AlternativeSubPlan
+                | T::T_SubLink
+                | T::T_PlaceHolderVar
+                | T::T_Aggref
+                | T::T_WindowFunc
+                | T::T_GroupingFunc
+        )
+    });
+    !refused
+        && !expr.contains_functions(&crate::postgres::customscan::score_funcoids())
+        && !pg_sys::contain_volatile_functions(expr)
+}
+
+/// Read an expression aggregate argument. `Ok(None)` falls through to the
+/// single-column path; `Err` declines the query.
+unsafe fn extract_aggref_arg_expr(
+    context: &RawColumnContext<'_>,
+    aggref: *mut pg_sys::Aggref,
+) -> Result<Option<AggArgExpr>, String> {
+    let Some(expr) = expression_aggregate_arg(aggref) else {
+        return Ok(None);
+    };
+
+    // Whole-row, system and outer-query columns have no indexed column to read.
+    if expr.any(|node| {
+        nodecast!(Var, T_Var, node)
+            .is_some_and(|var| (*var).varlevelsup != 0 || (*var).varattno <= 0)
+    }) {
+        return Err(
+            "an aggregate argument expression can only read plain columns of the query".into(),
+        );
+    }
+
+    let mut vars: Vec<AggExprVar> = Vec::new();
+    for crate::postgres::node::VarRef { rti, attno } in expr.collect_var_refs(true) {
+        if vars.iter().any(|v| v.rti == rti && v.attno == attno) {
+            continue;
+        }
+        let resolved = resolve_var_source(context, rti, attno, "aggregate argument")?;
+        vars.push(AggExprVar {
+            rti,
+            attno,
+            source_attno: resolved.attno,
+            plan_position: resolved.plan_position,
+            field_name: resolved.field_name,
+        });
+    }
+
+    let arg_expr = AggArgExpr {
+        pg_node_string: crate::postgres::deparse::node_to_string_owned(expr),
+        vars,
+    };
+    // Decline at planning, not execution, if the expression does not translate.
+    super::datafusion_exec::translate_agg_arg_expr(&arg_expr, context.plan)
+        .map_err(|e| format!("an aggregate argument expression cannot be translated: {e}"))?;
+    Ok(Some(arg_expr))
+}
+
 /// Extract the field reference from an `Aggref`'s arguments.
 ///
 /// For `COUNT(*)`: returns empty (no field).
@@ -1486,8 +1690,8 @@ unsafe fn extract_aggref_field_refs(
         // would strip the wrapper, causing DataFusion to compute e.g. SUM(score)
         // instead of the intended SUM(COALESCE(score, 0)).
         let var = unwrap_to_var(expr as *mut pg_sys::Node).ok_or(
-            "aggregate argument must be a direct column reference; \
-                     wrapped expressions (COALESCE, casts) are not supported for aggregate-on-join",
+            "aggregate argument must be a direct column reference or an expression of \
+                     indexed columns that can be pushed down (see the aggregate limitations)",
         )?;
 
         let resolved = resolve_var_source(

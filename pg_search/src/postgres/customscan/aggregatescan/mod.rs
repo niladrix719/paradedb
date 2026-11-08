@@ -668,6 +668,11 @@ impl CustomScan for AggregateScan {
                 let pdb_route = has_paradedb_agg
                     .then(|| unsafe { pdb_agg_route(builder.args().root, input_rel, shape) })
                     .flatten();
+                // Without a search operator the scan would do as much work as Postgres.
+                let has_search_operator = gucs::enable_custom_scan_without_operator()
+                    || unsafe {
+                        search_operator_relations::applies_to(builder.args().root, input_rel.relid)
+                    };
                 let use_datafusion = shape.is_distinct()
                     || unsafe {
                         // If the estimated number of groups exceeds Tantivy's bucket
@@ -699,12 +704,7 @@ impl CustomScan for AggregateScan {
                             || builder.args().has_numeric_aggregate()
                             // Tantivy sums int8 in f64, which rounds past 2^53. Only
                             // take queries the Tantivy backend would have taken.
-                            || (builder.args().has_int8_sum_aggregate()
-                                && (gucs::enable_custom_scan_without_operator()
-                                    || search_operator_relations::applies_to(
-                                        builder.args().root,
-                                        input_rel.relid,
-                                    )))
+                            || (builder.args().has_int8_sum_aggregate() && has_search_operator)
                             || pdb_route.as_ref().is_some_and(PdbAggRoute::references_numeric)
                             // Route DATE grouping to DataFusion for exact integer day conversion
                             // and explicit handling of PostgreSQL infinities. Tantivy histograms
@@ -715,6 +715,11 @@ impl CustomScan for AggregateScan {
                             // rejects DATE(timestamptz) and non-bare timestamp expressions.
                             || (!has_paradedb_agg && builder.args().has_date_group())
                             || groupby::has_ungrouped_column(builder.args())
+                            // Tantivy aggregates single fields, so `SUM(price - discount)`
+                            // only runs on DataFusion.
+                            || (!has_paradedb_agg
+                                && has_search_operator
+                                && builder.args().has_expression_aggregate(input_rel))
                     };
                 let use_datafusion = use_datafusion && (!has_paradedb_agg || pdb_route.is_some());
                 if use_datafusion {
@@ -1029,7 +1034,10 @@ impl CustomScan for AggregateScan {
 
                 // Show aggregates
                 let format_agg = |a: &join_targetlist::JoinAggregateEntry| -> String {
-                    if a.field_refs.is_empty() {
+                    if let Some(arg_expr) = &a.arg_expr {
+                        let text = explainer.deparse_serialized(&arg_expr.pg_node_string);
+                        format!("{}({text})", a.agg_kind)
+                    } else if a.field_refs.is_empty() {
                         // CountStar displays as "COUNT(*)" — no extra wrapping needed.
                         // Other no-arg aggregates (none currently) also use Display directly.
                         a.agg_kind.to_string()

@@ -520,6 +520,62 @@ impl CreateUpperPathsHookArgs {
             || (!(*parse).havingQual.is_null() && (*parse).havingQual.any(is_int8_sum))
     }
 
+    /// True when the query (including `HAVING`) aggregates an expression that only
+    /// DataFusion can read, such as `SUM(price - discount)`, and nothing neither
+    /// backend can. Expressions Tantivy reads as a field (`COALESCE(col, const)`, JSON
+    /// casts, indexed expressions) stay on Tantivy.
+    pub unsafe fn has_expression_aggregate(&self, input_rel: &pg_sys::RelOptInfo) -> bool {
+        let root = self.root;
+        let parse = (*root).parse;
+        if parse.is_null() {
+            return false;
+        }
+        let Some(heap_rti) = range_table::bms_exactly_one_member(input_rel.relids) else {
+            return false;
+        };
+        let Some(heap_relid) = range_table::get_rte(
+            (*root).simple_rel_array_size as usize,
+            (*root).simple_rte_array,
+            heap_rti,
+        )
+        .and_then(range_table::get_plain_relation_relid) else {
+            return false;
+        };
+        let Some((heaprel, index)) = crate::postgres::rel_get_bm25_index(heap_relid) else {
+            return false;
+        };
+        let source = pullup::SourceContext::new(heap_rti, heaprel, Some(index), None);
+        let var_context = crate::postgres::var::VarContext::from_planner(root);
+
+        let mut found = false;
+        for list in [(*parse).targetList.cast(), (*parse).havingQual] {
+            if list.is_null() {
+                continue;
+            }
+            for aggref in list.collect_nodes::<pg_sys::Aggref>() {
+                let Some(arg) = PgList::<pg_sys::TargetEntry>::from_pg((*aggref).args).get_ptr(0)
+                else {
+                    continue;
+                };
+                let tantivy_reads_it =
+                    aggregatescan::aggregate_type::ParsedAggregateField::from_index(
+                        (*arg).expr.cast(),
+                        var_context,
+                        &source,
+                    )
+                    .is_ok();
+                if tantivy_reads_it {
+                    continue;
+                }
+                if aggregatescan::join_targetlist::expression_aggregate_arg(aggref).is_none() {
+                    return false;
+                }
+                found = true;
+            }
+        }
+        found
+    }
+
     /// Returns true when a `GROUP BY` expression is `date(timestamp)` or
     /// `date(timestamptz)`.
     ///

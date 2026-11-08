@@ -2149,12 +2149,19 @@ pub unsafe fn populate_required_fields(
             })?;
         }
 
-        // Aggregate arguments - match by plan_position.
+        // Aggregate arguments, including an expression's columns - match by plan_position.
         for agg in &targetlist.aggregates {
-            for r in &agg.field_refs {
-                if source.plan_position == r.plan_position {
-                    let attno = r.attno;
-                    let field_name = &r.field_name;
+            let field_refs = agg
+                .field_refs
+                .iter()
+                .map(|r| (r.plan_position, r.attno, &r.field_name));
+            let expr_vars = agg
+                .arg_expr
+                .iter()
+                .flat_map(|e| &e.vars)
+                .map(|v| (v.plan_position, v.source_attno, &v.field_name));
+            for (plan_position, attno, field_name) in field_refs.chain(expr_vars) {
+                if source.plan_position == plan_position {
                     require_fast_field(source, &context, attno, || {
                         format!("aggregate argument '{}' (attno={attno})", field_name)
                     })?;

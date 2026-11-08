@@ -42,7 +42,8 @@ use crate::api::HashMap;
 use crate::index::fast_fields_helper::WhichFastField;
 use crate::index::reader::index::SearchIndexManifest;
 use crate::postgres::customscan::aggregatescan::join_targetlist::{
-    AggKind, JoinAggregateEntry, JoinAggregateTargetList, WindowAggInput, WindowAggKind,
+    AggArgExpr, AggExprVar, AggKind, JoinAggregateEntry, JoinAggregateTargetList, WindowAggInput,
+    WindowAggKind,
 };
 use crate::postgres::customscan::aggregatescan::privdat::{
     ColumnRef, CompareOp, DataFusionTopK, FilterExpr, TopKSortTarget,
@@ -87,7 +88,7 @@ use datafusion::functions_aggregate::expr_fn::{
 use datafusion::functions_aggregate::min_max::{max_udaf, min_udaf};
 use datafusion::functions_aggregate::string_agg::string_agg_udaf;
 use datafusion::functions_aggregate::sum::sum_udaf;
-use datafusion::logical_expr::expr::{AggregateFunction, Sort};
+use datafusion::logical_expr::expr::{AggregateFunction, Case, Sort};
 use datafusion::logical_expr::{
     Aggregate, AggregateUDF, Cast, Expr, GroupingSet, LogicalPlan, LogicalPlanBuilder,
     LogicalPlanBuilderOptions, col, lit,
@@ -332,6 +333,11 @@ pub async fn build_join_aggregate_plan(
             };
             // Apply per-aggregate FILTER clause if present.
             let agg_expr = match df_filter {
+                // DataFusion evaluates arguments before the FILTER, so guard the
+                // expression: `SUM(a / b) FILTER (WHERE b <> 0)` must not divide by 0.
+                Some(df_filter) if agg.arg_expr.is_some() => {
+                    with_filter(with_filtered_first_arg(agg_expr, &df_filter), df_filter)
+                }
                 Some(df_filter) => with_filter(agg_expr, df_filter),
                 None => agg_expr,
             };
@@ -1603,8 +1609,111 @@ fn with_filter(expr: Expr, filter: Expr) -> Expr {
     }
 }
 
+/// Replace an `Expr::AggregateFunction` with the same call but its first argument
+/// wrapped as `CASE WHEN filter THEN arg END`; later arguments, such as the
+/// `STRING_AGG` separator, stay literals. Non-aggregate-function expressions are
+/// returned unchanged.
+fn with_filtered_first_arg(expr: Expr, filter: &Expr) -> Expr {
+    match expr {
+        Expr::AggregateFunction(af) => {
+            let args = af
+                .params
+                .args
+                .into_iter()
+                .enumerate()
+                .map(|(i, arg)| match i {
+                    0 => Expr::Case(Case {
+                        expr: None,
+                        when_then_expr: vec![(Box::new(filter.clone()), Box::new(arg))],
+                        else_expr: None,
+                    }),
+                    _ => arg,
+                })
+                .collect();
+            Expr::AggregateFunction(AggregateFunction::new_udf(
+                af.func,
+                args,
+                af.params.distinct,
+                af.params.filter,
+                af.params.order_by,
+                af.params.null_treatment,
+            ))
+        }
+        other => other,
+    }
+}
+
+/// Maps the `Var`s of an aggregate-argument expression to plan columns.
+struct AggExprMapper<'a> {
+    plan: &'a RelNode,
+    vars: &'a [AggExprVar],
+}
+
+impl<'a> ColumnMapper for AggExprMapper<'a> {
+    fn map_var(&self, varno: pg_sys::Index, varattno: pg_sys::AttrNumber) -> Option<Expr> {
+        let v = self
+            .vars
+            .iter()
+            .find(|v| v.rti == varno && v.attno == varattno)?;
+        Some(make_plan_position_col(
+            self.plan,
+            v.plan_position,
+            &v.field_name,
+        ))
+    }
+}
+
+/// Whether `node` is only `float8` columns and constants combined with `+`, `-` and
+/// `*`, the only expressions computed natively. [`PredicateTranslator::translate`]
+/// computes some others differently from Postgres (`round(2.5)`, `ln(0)`, `float4`
+/// columns), so anything else is evaluated by Postgres. A native overflow gives
+/// `Infinity` where Postgres raises an error.
+unsafe fn is_float8_arithmetic(node: *mut pg_sys::Node) -> bool {
+    if let Some(var) = crate::nodecast!(Var, T_Var, node) {
+        return (*var).vartype == pg_sys::FLOAT8OID;
+    }
+    if let Some(konst) = crate::nodecast!(Const, T_Const, node) {
+        return (*konst).consttype == pg_sys::FLOAT8OID && !(*konst).constisnull;
+    }
+    let Some(op) = crate::nodecast!(OpExpr, T_OpExpr, node) else {
+        return false;
+    };
+    let args = pgrx::PgList::<pg_sys::Node>::from_pg((*op).args);
+    matches!(
+        (*op).opfuncid.to_u32(),
+        pg_sys::F_FLOAT8PL | pg_sys::F_FLOAT8MI | pg_sys::F_FLOAT8MUL
+    ) && args.iter_ptr().all(|arg| is_float8_arithmetic(arg))
+}
+
+/// Translate an aggregate-argument expression: natively for `float8` arithmetic,
+/// otherwise as one `PgExprUdf` around the whole expression.
+pub(crate) fn translate_agg_arg_expr(arg: &AggArgExpr, plan: &RelNode) -> Result<Expr> {
+    let sources = plan.output_sources();
+    let mapper = AggExprMapper {
+        plan,
+        vars: &arg.vars,
+    };
+    let text = std::ffi::CString::new(arg.pg_node_string.as_str())
+        .expect("nodeToString snapshot cannot contain an interior NUL");
+    let translated = unsafe {
+        let node = pg_sys::stringToNode(text.as_ptr().cast_mut()).cast::<pg_sys::Node>();
+        let translator = PredicateTranslator::new(&sources).with_mapper(Box::new(mapper));
+        if is_float8_arithmetic(node) {
+            translator.translate(node)
+        } else {
+            translator.try_wrap_as_udf(node)
+        }
+    };
+    translated.ok_or_else(|| {
+        DataFusionError::Internal("could not translate an aggregate argument".to_string())
+    })
+}
+
 /// Build a DataFusion column expression for an aggregate's first field reference.
 fn agg_field_col(agg: &JoinAggregateEntry, plan: &RelNode) -> Result<Expr> {
+    if let Some(arg_expr) = &agg.arg_expr {
+        return translate_agg_arg_expr(arg_expr, plan);
+    }
     let r = agg.field_refs.first().ok_or_else(|| {
         DataFusionError::Internal("non-COUNT(*) aggregate must have a field reference".to_string())
     })?;
@@ -1628,6 +1737,9 @@ fn agg_order_by_exprs(order_by: &[AggOrderByEntry], plan: &RelNode) -> Vec<Sort>
 /// Build DataFusion column expressions for all of an aggregate's field references.
 /// Used for multi-column DISTINCT (e.g. `COUNT(DISTINCT col1, col2)`).
 fn agg_field_cols(agg: &JoinAggregateEntry, plan: &RelNode) -> Result<Vec<Expr>> {
+    if let Some(arg_expr) = &agg.arg_expr {
+        return Ok(vec![translate_agg_arg_expr(arg_expr, plan)?]);
+    }
     agg.field_refs
         .iter()
         .map(|r| Ok(make_plan_position_col(plan, r.plan_position, &r.field_name)))

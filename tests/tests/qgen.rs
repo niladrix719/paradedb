@@ -647,6 +647,13 @@ async fn generated_group_by_aggregates(database: Db, #[case] churn_on: bool) {
             ),
             group_by_expr in arb_group_by(grouping_columns.clone(), vec![
                 "COUNT(*)", "SUM(price)", "AVG(price)", "MIN(quantity)", "MAX(quantity)", "SUM(age)", "AVG(age)",
+                "SUM(age + quantity)",
+                "SUM(age * 2)",
+                "MIN(age - quantity)",
+                "MAX(quantity * 2)",
+                "COUNT(age + 1)",
+                "SUM(age::double precision * 2)",
+                "AVG(age::double precision - quantity)",
                 "COUNT(metadata->>'brand')",
                 "COUNT((metadata->>'rating')::bigint)",
                 "SUM((metadata->>'rating')::bigint)",
@@ -987,6 +994,9 @@ async fn generated_aggregate_join(database: Db, #[case] churn_on: bool) {
                         format!("COUNT(DISTINCT {table}.age)"),
                         format!("SUM(DISTINCT {table}.age)"),
                         format!("AVG(DISTINCT {table}.age)"),
+                        format!("SUM({table}.age + {table}.quantity)"),
+                        format!("MIN({table}.quantity * 2)"),
+                        format!("MAX({table}.age - {table}.quantity)"),
                     ]);
                 }
                 (

@@ -1,0 +1,5 @@
+---
+header: features
+---
+
+The aggregate scan now pushes down aggregates whose argument is an expression over columnar indexed columns, such as `SUM(price - discount) FILTER (WHERE status = 'returned')`, on a single table and over a join. See [Expression Arguments](/reference/aggregates/limitations#expression-arguments) for the supported aggregates and the forms that still run on Postgres.

@@ -109,6 +109,32 @@ The following forms still fall back to native Postgres execution:
 - `DATE(text_column::timestamp)` and other non-bare timestamp expressions.
 - Other scalar grouping functions, such as `date_trunc(...)` and `lower(...)`.
 
+## Expression Arguments
+
+An aggregate argument can be an expression over integer, float, boolean, date, timestamp and text columns that are [columnar indexed](/reference/indexing/columnar). This works on a single table, over a join, and in a `HAVING` clause:
+
+```sql
+SELECT SUM(price - discount) FILTER (WHERE status = 'returned'),
+       SUM(price - discount)
+FROM invoices
+WHERE description @@@ 'widget';
+```
+
+`SUM`, `AVG`, `MIN`, `MAX`, `COUNT`, `STDDEV`, `STDDEV_POP`, `VARIANCE`, `VAR_POP`, `BOOL_AND`, `BOOL_OR`, `ARRAY_AGG` and `STRING_AGG` are supported, with `FILTER` and `GROUP BY`. `DISTINCT` works over an integer or boolean expression, such as `COUNT(DISTINCT qty * 2)`, and `ARRAY_AGG` and `STRING_AGG` accept an `ORDER BY` on columns. `MIN` and `MAX` of a text expression follow the column's collation, under the same rule as for a plain text column. `AVG`, `STDDEV` and `VARIANCE` of an integer expression return `NUMERIC` computed as a float, with the same precision as for a plain integer column. The usual aggregate pushdown requirements still apply, including a ParadeDB operator in the query.
+
+`float8` arithmetic with only `+`, `-` and `*` is computed natively by the aggregate scan. Where one of those operations overflows or underflows, the result is `Infinity` or `0` instead of the error Postgres raises, as in Join Scan. Every other expression, including integer arithmetic and function calls, is evaluated by Postgres, so it returns the same values and raises the same errors, at the cost of evaluating it row by row.
+
+Evaluating the expression row by row costs about as much as it does without pushdown, so the gain comes from the aggregation itself. With a `GROUP BY`, a join or `DISTINCT`, an expression evaluated by Postgres is typically 1.4 to 7 times faster than without pushdown. A plain aggregate without them, such as `SUM(qty * 2)`, can be up to about 20% slower. To run such a query on Postgres instead, run `SET paradedb.enable_aggregate_custom_scan TO off;`.
+
+The following forms still fall back to native Postgres execution:
+
+- The expression reads a `NUMERIC` column. These columns are stored encoded, so Postgres would have to evaluate the expression row by row, which is slower than not pushing it down. A plain `NUMERIC` column is still pushed down.
+- The expression computes on a JSON sub-field, such as `SUM((metadata->>'qty')::int * 2)`. A bare `SUM((metadata->>'qty')::int)` is a field of its own.
+- The result is `NUMERIC` or a date.
+- `DISTINCT` over a float expression, which DataFusion compares differently from Postgres for `-0.0` and `0.0`, or on `ARRAY_AGG` and `STRING_AGG`.
+- An `ORDER BY` inside any other aggregate, or an `ORDER BY` on an expression.
+- The expression contains a parameter, a subquery, a volatile function, or `pdb.score(...)`.
+
 ## Join Support
 
 Aggregate pushdown works across joins as well as single tables. When every participating table has a ParadeDB index, ParadeDB computes the result directly from the index's columnar storage, without scanning the underlying table rows. The custom aggregate scan is enabled by default; to turn it off, run `SET paradedb.enable_aggregate_custom_scan TO off;`.
@@ -151,6 +177,6 @@ For aggregates over joins, ParadeDB falls back to native Postgres execution when
 - Join keys, `GROUP BY` columns, or aggregate arguments are not indexed columns
 - The query uses `ROLLUP`, `CUBE`, `GROUPING SETS`, `LATERAL`, `DISTINCT ON`, or window functions other than the pushed-down `pdb.agg(...) OVER ()` and `pdb.combine_agg(pdb.agg(...)) OVER ()` forms described above
 - `GROUP BY` uses a scalar function like `date_trunc(...)` or `lower(...)` (JSON sub-field access via `->>` is supported)
-- The aggregate argument or result is wrapped in an expression such as `COALESCE(SUM(...), 0)` or a cast
+- The aggregate result is wrapped in an expression such as `COALESCE(SUM(...), 0)` or a cast, or the argument is an expression that [cannot be pushed down](#expression-arguments)
 
 When a fallback happens, the query still runs correctly through Postgres' native planner. ParadeDB simply does not accelerate it.
