@@ -1,0 +1,5 @@
+---
+header: stability
+---
+
+- Fixed Join Scan expressions that compare or combine a `real` (`float4`) column with a `double precision` column, such as `a.r > b.d` or `a.r + b.d`. They used a rounded copy of the stored `real` value and could return different rows or values than PostgreSQL.

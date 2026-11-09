@@ -25,21 +25,24 @@
 //! MinMaxExpr, ScalarArrayOpExpr, and CoerceViaIO — plus a UDF fallback hook
 //! (`try_wrap_as_udf`) for opaque expressions.
 
+use datafusion::arrow::datatypes::DataType;
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::expr::{Case, InList, ScalarFunction};
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator, ScalarUDF, col, lit};
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator, ScalarUDF, cast, col, lit};
 use pgrx::{PgList, pg_sys};
 use std::ffi::CStr;
 use std::sync::Arc;
 
 use crate::api::HashSet;
 use crate::postgres::customscan::collation_semantics::{CollationOperation, collation_supports};
+use crate::postgres::customscan::datafusion::float_div::float_div_udf;
 use crate::postgres::customscan::datafusion::translator::{
     PredicateTranslator, node_tag_debug, type_name,
 };
 use crate::postgres::customscan::expr_eval::InputVarInfo;
 use crate::postgres::customscan::pg_expr_udf::{InputDecode, PgExprUdf};
 use crate::postgres::node::NodeExt;
+use crate::postgres::types_arrow::udf_pg_type_to_arrow;
 
 const PVC_RECURSE_ALL: i32 = (pg_sys::PVC_RECURSE_AGGREGATES
     | pg_sys::PVC_RECURSE_WINDOWFUNCS
@@ -82,6 +85,24 @@ impl<'a> PredicateTranslator<'a> {
         let df_args = df_args?;
 
         let funcid = (*func).funcid;
+
+        // Integer to float casts round to nearest like PostgreSQL's C casts, and
+        // float4 to float8 widens exactly. float4(float8) can overflow and numeric
+        // is storage-encoded, so those stay with the UDF fallback.
+        if matches!(
+            funcid.to_u32(),
+            pg_sys::F_FLOAT8_INT2
+                | pg_sys::F_FLOAT8_INT4
+                | pg_sys::F_FLOAT8_INT8
+                | pg_sys::F_FLOAT8_FLOAT4
+                | pg_sys::F_FLOAT4_INT2
+                | pg_sys::F_FLOAT4_INT4
+                | pg_sys::F_FLOAT4_INT8
+        ) {
+            let target = udf_pg_type_to_arrow((*func).funcresulttype)?;
+            return Some(cast(df_args.into_iter().next()?, target));
+        }
+
         let namespace_oid = pg_sys::get_func_namespace(funcid);
         let namespace_ptr = pg_sys::get_namespace_name(namespace_oid);
         let func_name = crate::postgres::catalog::lookup_func_name(funcid);
@@ -617,21 +638,28 @@ impl<'a> PredicateTranslator<'a> {
             return None;
         }
 
-        // Arrow divides floats by zero to Infinity or NaN where PostgreSQL raises an
-        // error, so let the UDF fallback evaluate float division.
+        // Arrow divides floats per IEEE-754 where PostgreSQL raises on a zero
+        // divisor, overflow or underflow, so float division uses a checked kernel.
+        // Operands are cast to the result type, so float4 / float4 runs in float4
+        // and the float4 side of float48div / float84div is widened to float8.
         if op == Operator::Divide
             && matches!(
                 (*op_expr).opresulttype,
                 pg_sys::FLOAT4OID | pg_sys::FLOAT8OID
             )
         {
-            pgrx::debug1!(
-                "PredicateTranslator: float division left to PostgreSQL [OpExpr] types=({}, {}) | {}",
-                type_name(left_type),
-                type_name(right_type),
-                self.deparse_for_debug(node)
-            );
-            return None;
+            let is_float = |t| matches!(t, pg_sys::FLOAT4OID | pg_sys::FLOAT8OID);
+            if !is_float(left_type) || !is_float(right_type) {
+                pgrx::debug1!(
+                    "PredicateTranslator: non-float division left to PostgreSQL [OpExpr] types=({}, {}) | {}",
+                    type_name(left_type),
+                    type_name(right_type),
+                    self.deparse_for_debug(node)
+                );
+                return None;
+            }
+            let ty = udf_pg_type_to_arrow((*op_expr).opresulttype)?;
+            return Some(float_div_udf().call(vec![cast(left, ty.clone()), cast(right, ty)]));
         }
 
         let collid = (*op_expr).inputcollid;
@@ -668,6 +696,13 @@ impl<'a> PredicateTranslator<'a> {
 
         if let Some(ref mapper) = self.mapper {
             if let Some(expr) = mapper.map_var(varno, varattno) {
+                // float4 is indexed as the f64 nearest its text form (3e38, not
+                // 3.0000000054977558e38). Narrowing recovers the exact float4, which
+                // DataFusion then widens exactly, as PostgreSQL does for float4 / float8
+                // arithmetic and comparisons.
+                if pg_sys::getBaseType((*var).vartype) == pg_sys::FLOAT4OID {
+                    return Some(cast(expr, DataType::Float32));
+                }
                 return Some(expr);
             }
             pgrx::debug1!(
